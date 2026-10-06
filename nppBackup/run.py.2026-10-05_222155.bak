@@ -20,7 +20,6 @@ REQUIRED_IMPORTS = {
     "playwright": "playwright",
     "requests": "requests",
     "m3u8": "m3u8",
-    "yt_dlp": "yt-dlp",
 }
 
 

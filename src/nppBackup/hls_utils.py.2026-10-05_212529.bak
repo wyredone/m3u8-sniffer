@@ -6,19 +6,22 @@ from datetime import datetime
 from typing import Any
 from urllib.parse import urlparse
 
-EXCLUDE_EXTENSIONS = (
-    ".js", ".css", ".json", ".html", ".htm", ".png", ".jpg", ".jpeg",
-    ".gif", ".svg", ".ico", ".woff", ".woff2", ".ttf", ".eot"
-)
-
+# Extensions for adaptive manifests, video/audio segments, progressive video, and live sessions
 STREAM_EXTENSIONS = (
     ".m3u8",  # HLS Manifest
     ".mpd",   # MPEG-DASH Manifest
     ".ism",   # Smooth Streaming Server Manifest
     ".ismc",  # Smooth Streaming Client Manifest
+    ".ts",    # MPEG Transport Stream Segment
+    ".m4s",   # Fragmented MP4 Segment
+    ".cmfv",  # CMAF Video Track
+    ".cmfa",  # CMAF Audio Track
+    ".mp4",   # Progressive MP4
+    ".webm",  # Progressive WebM
     ".sdp",   # Session Description Protocol
 )
 
+# Content types associated with streaming and progressive video delivery
 MEDIA_MIME_TYPES = {
     "application/vnd.apple.mpegurl",
     "application/x-mpegurl",
@@ -34,6 +37,7 @@ MEDIA_MIME_TYPES = {
     "video/webm",
     "audio/webm",
     "application/sdp",
+    "application/octet-stream",
 }
 
 M3U8_URL_RE = re.compile(r"\.m3u8(?:$|[?#])", re.IGNORECASE)
@@ -54,51 +58,6 @@ def url_fingerprint(url: str) -> str:
     return hashlib.sha256(normalized.encode("utf-8", errors="ignore")).hexdigest()[:16]
 
 
-def is_segment_chunk(url: str) -> bool:
-    lowered = (url or "").lower()
-    return (
-        "range=" in lowered
-        or "/range/" in lowered
-        or "bytes=" in lowered
-        or lowered.endswith((".ts", ".m4s", ".cmfv", ".cmfa"))
-    )
-
-
-def derive_m3u8_from_segment(url: str) -> str | None:
-    if not url:
-        return None
-
-    # Handle Pornhub / standard HLS segment URLs
-    ph_match = re.search(r'(.+/)(seg-\d+-(v\d+-a\d+)\.ts)(\?.*)?$', url, re.IGNORECASE)
-    if ph_match:
-        base_path = ph_match.group(1)
-        v_tag = ph_match.group(3)
-        query = ph_match.group(4) or ""
-        return f"{base_path}index-{v_tag}.m3u8{query}"
-
-    generic_match = re.search(r'(.+/)(seg(?:ment)?[-_]?\d+[^/]*\.(?:ts|m4s|cmfv|cmfa))(\?.*)?$', url, re.IGNORECASE)
-    if generic_match:
-        base_path = generic_match.group(1)
-        query = generic_match.group(3) or ""
-        return f"{base_path}index.m3u8{query}"
-
-    return None
-
-
-def extract_m3u8_from_html(html_text: str) -> list[str]:
-    if not html_text:
-        return []
-    normalized = html_text.replace(r"\/", "/")
-    pattern = r'https?://[^\s"\'<>]+\.m3u8[^\s"\'<>]*'
-    matches = re.findall(pattern, normalized)
-    cleaned = []
-    for m in matches:
-        clean_url = m.replace("&amp;", "&")
-        if clean_url not in cleaned:
-            cleaned.append(clean_url)
-    return cleaned
-
-
 def is_probable_m3u8_url(url: str) -> bool:
     if not url:
         return False
@@ -109,22 +68,17 @@ def is_probable_m3u8_url(url: str) -> bool:
 def is_probable_media_stream_url(url: str) -> bool:
     if not url:
         return False
+    if is_probable_m3u8_url(url):
+        return True
 
     clean_url = url.split("?")[0].split("#")[0].lower()
-
-    if any(clean_url.endswith(ext) for ext in EXCLUDE_EXTENSIONS):
-        return False
-
     if clean_url.startswith("blob:"):
         return True
 
     if any(clean_url.endswith(ext) for ext in STREAM_EXTENSIONS):
         return True
 
-    if clean_url.endswith((".mp4", ".webm")) and not is_segment_chunk(url):
-        return True
-
-    return any(keyword in clean_url for keyword in ("m3u8", "manifest", "playlist", "smoothstream")) and not is_segment_chunk(url)
+    return any(keyword in clean_url for keyword in ("m3u8", "manifest", "playlist", "smoothstream"))
 
 
 def content_type_is_hls(content_type: str | None) -> bool:
@@ -140,13 +94,11 @@ def content_type_is_media_stream(content_type: str | None) -> bool:
     if not content_type:
         return False
     main_type = content_type.split(";", 1)[0].strip().lower()
-    if main_type in ("application/javascript", "text/javascript", "text/css", "text/html"):
-        return False
     if main_type in MEDIA_MIME_TYPES:
         return True
     return any(
         mime in main_type
-        for mime in ("mpegurl", "m3u8", "dash+xml", "ms-sstr", "mp2t", "iso.segment")
+        for mime in ("mpegurl", "m3u8", "dash+xml", "ms-sstr", "mp2t", "iso.segment", "video/", "audio/")
     )
 
 
@@ -190,7 +142,7 @@ def playlist_kind(text: str | None, url: str = "", content_type: str = "") -> st
         return "Master"
     if text and "#EXTINF" in text:
         return "Media"
-    if "master" in (url or "").lower() or "playlist.m3u8" in (url or "").lower():
+    if "master" in (url or "").lower():
         return "Likely Master"
     if "playlist" in (url or "").lower():
         return "Playlist"
@@ -261,21 +213,22 @@ def rank_capture(record: dict[str, Any]) -> int:
     elif 200 <= status_code < 400:
         score += 15
 
-    if "master" in kind or "master" in url or "playlist.m3u8" in url or "manifest.mpd" in url or "index-" in url:
-        score += 60
-    elif "playlist" in url or "media.m3u8" in url:
-        score += 20
-
+    if "master" in kind or "master" in url:
+        score += 35
+    if "dash" in kind or "smooth" in kind:
+        score += 30
+    if "progressive" in kind or "mp4" in url:
+        score += 25
     if "#EXT-X-STREAM-INF" in (record.get("playlist_sample") or ""):
-        score += 40
+        score += 35
     if record.get("resolution"):
         score += 20
     if record.get("bandwidth"):
         score += 10
-
-    if is_segment_chunk(url):
-        score -= 80
-
+    if "playlist" in url or "manifest" in url:
+        score += 5
+    if "chunk" in url or "segment" in url:
+        score -= 15
     return max(score, 0)
 
 

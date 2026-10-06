@@ -13,8 +13,6 @@ from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 
 from .hls_utils import (
     content_type_is_media_stream,
-    derive_m3u8_from_segment,
-    extract_m3u8_from_html,
     is_probable_media_stream_url,
     is_segment_chunk,
     looks_like_hls_text,
@@ -33,8 +31,6 @@ AD_DOMAIN_KEYWORDS = (
     "telemetry",
     "scorecardresearch.com",
     "quantserve.com",
-    "trafficjunky.net",
-    "adtng.com",
     "/ads/",
     "ad-delivery",
     "dai.google.com",
@@ -284,31 +280,6 @@ class BrowserThread(QThread):
             self.status_changed.emit(f"Opening: {url}")
             await page.goto(url, wait_until="domcontentloaded", timeout=45_000)
             self.page_changed.emit(page.url)
-
-            # Scan HTML for inline m3u8 playlist links (e.g., Pornhub flashvars)
-            try:
-                html_content = await page.content()
-                inline_m3u8_links = extract_m3u8_from_html(html_content)
-                user_agent = await self._get_page_user_agent(page)
-                for m3u8_link in inline_m3u8_links:
-                    if not is_ad_domain(m3u8_link):
-                        record = make_capture_record(
-                            m3u8_url=m3u8_link,
-                            source_page=page.url,
-                            event_source="inline_html",
-                            method="GET",
-                            status_code=200,
-                            content_type="application/vnd.apple.mpegurl",
-                            referer=page.url,
-                            origin=origin_from_url(page.url),
-                            user_agent=user_agent,
-                            resource_type="document",
-                            playlist_text=None,
-                        )
-                        self.stream_detected.emit(record)
-            except Exception:
-                pass
-
             self.status_changed.emit("Page loaded. Click through manually; detected streams will appear here.")
         except Exception as exc:
             self.error_reported.emit(f"Navigation failed: {exc}")
@@ -354,18 +325,7 @@ class BrowserThread(QThread):
             return
 
         url = request.url or ""
-        if is_ad_domain(url):
-            return
-
-        # Auto-reconstruct parent M3U8 from segment chunks
-        if is_segment_chunk(url):
-            derived_m3u8 = derive_m3u8_from_segment(url)
-            if derived_m3u8:
-                url = derived_m3u8
-            else:
-                return
-
-        if not is_probable_media_stream_url(url):
+        if not is_probable_media_stream_url(url) or is_ad_domain(url):
             return
 
         try:
@@ -398,16 +358,8 @@ class BrowserThread(QThread):
             return
 
         url = response.url or ""
-        if is_ad_domain(url):
+        if is_ad_domain(url) or is_segment_chunk(url):
             return
-
-        # Auto-reconstruct parent M3U8 from segment chunks
-        if is_segment_chunk(url):
-            derived_m3u8 = derive_m3u8_from_segment(url)
-            if derived_m3u8:
-                url = derived_m3u8
-            else:
-                return
 
         headers = dict(response.headers or {})
         content_type = headers.get("content-type", "")

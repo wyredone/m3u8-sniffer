@@ -12,11 +12,8 @@ from PySide6.QtCore import QThread, Signal
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page, Request, Response
 
 from .hls_utils import (
-    content_type_is_media_stream,
-    derive_m3u8_from_segment,
-    extract_m3u8_from_html,
-    is_probable_media_stream_url,
-    is_segment_chunk,
+    content_type_is_hls,
+    is_probable_m3u8_url,
     looks_like_hls_text,
     make_capture_record,
     origin_from_url,
@@ -33,8 +30,6 @@ AD_DOMAIN_KEYWORDS = (
     "telemetry",
     "scorecardresearch.com",
     "quantserve.com",
-    "trafficjunky.net",
-    "adtng.com",
     "/ads/",
     "ad-delivery",
     "dai.google.com",
@@ -46,7 +41,60 @@ def is_ad_domain(url: str) -> bool:
     return any(keyword in url_lower for keyword in AD_DOMAIN_KEYWORDS)
 
 
+def is_probable_media_stream_url(url: str) -> bool:
+    """Checks if the URL matches standard stream formats (HLS, DASH, TS/m4s segments, blob)."""
+    if not url:
+        return False
+    if is_probable_m3u8_url(url):
+        return True
+    clean_url = url.split("?")[0].split("#")[0].lower()
+    return (
+        clean_url.endswith((".m3u8", ".mpd", ".ts", ".m4s"))
+        or "m3u8" in clean_url
+        or "manifest" in clean_url
+        or "playlist" in clean_url
+        or clean_url.startswith("blob:")
+    )
+
+
+def content_type_is_media_stream(content_type: str) -> bool:
+    """Checks if the Content-Type header indicates HLS, DASH, or media segment content."""
+    if not content_type:
+        return False
+    if content_type_is_hls(content_type):
+        return True
+    ct = content_type.lower()
+    return any(
+        media_type in ct
+        for media_type in (
+            "application/x-mpegurl",
+            "application/vnd.apple.mpegurl",
+            "application/dash+xml",
+            "video/mp2t",
+            "video/iso.segment",
+            "audio/mp4",
+            "video/mp4",
+        )
+    )
+
+
+def detect_stream_format(url: str, content_type: str = "") -> str:
+    """Identifies stream media classification (HLS, DASH, TS Segment, fMP4, Blob)."""
+    clean_url = url.split("?")[0].split("#")[0].lower()
+    ct = content_type.lower()
+    if clean_url.endswith(".mpd") or "dash+xml" in ct:
+        return "DASH"
+    if clean_url.endswith(".ts") or "video/mp2t" in ct:
+        return "TS Segment"
+    if clean_url.endswith(".m4s") or "iso.segment" in ct:
+        return "fMP4 Segment"
+    if url.startswith("blob:"):
+        return "Blob Stream"
+    return "HLS"
+
+
 def parse_m3u8_variants(playlist_text: str) -> list[dict[str, Any]]:
+    """Extracts stream qualities, bandwidths, resolution, codecs, and URLs from Master Playlists."""
     variants: list[dict[str, Any]] = []
     if not playlist_text or "#EXT-X-STREAM-INF" not in playlist_text:
         return variants
@@ -284,31 +332,6 @@ class BrowserThread(QThread):
             self.status_changed.emit(f"Opening: {url}")
             await page.goto(url, wait_until="domcontentloaded", timeout=45_000)
             self.page_changed.emit(page.url)
-
-            # Scan HTML for inline m3u8 playlist links (e.g., Pornhub flashvars)
-            try:
-                html_content = await page.content()
-                inline_m3u8_links = extract_m3u8_from_html(html_content)
-                user_agent = await self._get_page_user_agent(page)
-                for m3u8_link in inline_m3u8_links:
-                    if not is_ad_domain(m3u8_link):
-                        record = make_capture_record(
-                            m3u8_url=m3u8_link,
-                            source_page=page.url,
-                            event_source="inline_html",
-                            method="GET",
-                            status_code=200,
-                            content_type="application/vnd.apple.mpegurl",
-                            referer=page.url,
-                            origin=origin_from_url(page.url),
-                            user_agent=user_agent,
-                            resource_type="document",
-                            playlist_text=None,
-                        )
-                        self.stream_detected.emit(record)
-            except Exception:
-                pass
-
             self.status_changed.emit("Page loaded. Click through manually; detected streams will appear here.")
         except Exception as exc:
             self.error_reported.emit(f"Navigation failed: {exc}")
@@ -354,18 +377,7 @@ class BrowserThread(QThread):
             return
 
         url = request.url or ""
-        if is_ad_domain(url):
-            return
-
-        # Auto-reconstruct parent M3U8 from segment chunks
-        if is_segment_chunk(url):
-            derived_m3u8 = derive_m3u8_from_segment(url)
-            if derived_m3u8:
-                url = derived_m3u8
-            else:
-                return
-
-        if not is_probable_media_stream_url(url):
+        if not is_probable_media_stream_url(url) or is_ad_domain(url):
             return
 
         try:
@@ -389,6 +401,7 @@ class BrowserThread(QThread):
                 response_headers={},
                 playlist_text=None,
             )
+            record["stream_format"] = detect_stream_format(url)
             self.stream_detected.emit(record)
         except Exception as exc:
             self.error_reported.emit(f"Request capture error: {exc}")
@@ -400,14 +413,6 @@ class BrowserThread(QThread):
         url = response.url or ""
         if is_ad_domain(url):
             return
-
-        # Auto-reconstruct parent M3U8 from segment chunks
-        if is_segment_chunk(url):
-            derived_m3u8 = derive_m3u8_from_segment(url)
-            if derived_m3u8:
-                url = derived_m3u8
-            else:
-                return
 
         headers = dict(response.headers or {})
         content_type = headers.get("content-type", "")
@@ -459,6 +464,8 @@ class BrowserThread(QThread):
                 response_headers=headers,
                 playlist_text=playlist_text,
             )
+
+            record["stream_format"] = detect_stream_format(url, content_type)
 
             if playlist_text and "#EXT-X-STREAM-INF" in playlist_text:
                 variants = parse_m3u8_variants(playlist_text)

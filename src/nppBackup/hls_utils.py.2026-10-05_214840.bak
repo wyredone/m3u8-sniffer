@@ -6,11 +6,13 @@ from datetime import datetime
 from typing import Any
 from urllib.parse import urlparse
 
+# Extensions to strictly exclude from media capture
 EXCLUDE_EXTENSIONS = (
     ".js", ".css", ".json", ".html", ".htm", ".png", ".jpg", ".jpeg",
     ".gif", ".svg", ".ico", ".woff", ".woff2", ".ttf", ".eot"
 )
 
+# Target media extensions
 STREAM_EXTENSIONS = (
     ".m3u8",  # HLS Manifest
     ".mpd",   # MPEG-DASH Manifest
@@ -19,6 +21,7 @@ STREAM_EXTENSIONS = (
     ".sdp",   # Session Description Protocol
 )
 
+# Content types associated with streaming and progressive video delivery
 MEDIA_MIME_TYPES = {
     "application/vnd.apple.mpegurl",
     "application/x-mpegurl",
@@ -64,41 +67,6 @@ def is_segment_chunk(url: str) -> bool:
     )
 
 
-def derive_m3u8_from_segment(url: str) -> str | None:
-    if not url:
-        return None
-
-    # Handle Pornhub / standard HLS segment URLs
-    ph_match = re.search(r'(.+/)(seg-\d+-(v\d+-a\d+)\.ts)(\?.*)?$', url, re.IGNORECASE)
-    if ph_match:
-        base_path = ph_match.group(1)
-        v_tag = ph_match.group(3)
-        query = ph_match.group(4) or ""
-        return f"{base_path}index-{v_tag}.m3u8{query}"
-
-    generic_match = re.search(r'(.+/)(seg(?:ment)?[-_]?\d+[^/]*\.(?:ts|m4s|cmfv|cmfa))(\?.*)?$', url, re.IGNORECASE)
-    if generic_match:
-        base_path = generic_match.group(1)
-        query = generic_match.group(3) or ""
-        return f"{base_path}index.m3u8{query}"
-
-    return None
-
-
-def extract_m3u8_from_html(html_text: str) -> list[str]:
-    if not html_text:
-        return []
-    normalized = html_text.replace(r"\/", "/")
-    pattern = r'https?://[^\s"\'<>]+\.m3u8[^\s"\'<>]*'
-    matches = re.findall(pattern, normalized)
-    cleaned = []
-    for m in matches:
-        clean_url = m.replace("&amp;", "&")
-        if clean_url not in cleaned:
-            cleaned.append(clean_url)
-    return cleaned
-
-
 def is_probable_m3u8_url(url: str) -> bool:
     if not url:
         return False
@@ -112,18 +80,22 @@ def is_probable_media_stream_url(url: str) -> bool:
 
     clean_url = url.split("?")[0].split("#")[0].lower()
 
+    # Reject static web assets (e.g. Next.js _buildManifest.js)
     if any(clean_url.endswith(ext) for ext in EXCLUDE_EXTENSIONS):
         return False
 
     if clean_url.startswith("blob:"):
         return True
 
+    # Check manifest/playlist extensions
     if any(clean_url.endswith(ext) for ext in STREAM_EXTENSIONS):
         return True
 
+    # Standalone progressive MP4/WebM (excluding byte range chunk requests)
     if clean_url.endswith((".mp4", ".webm")) and not is_segment_chunk(url):
         return True
 
+    # Keyword check ONLY if not a static web asset or byte-range chunk
     return any(keyword in clean_url for keyword in ("m3u8", "manifest", "playlist", "smoothstream")) and not is_segment_chunk(url)
 
 
@@ -261,7 +233,8 @@ def rank_capture(record: dict[str, Any]) -> int:
     elif 200 <= status_code < 400:
         score += 15
 
-    if "master" in kind or "master" in url or "playlist.m3u8" in url or "manifest.mpd" in url or "index-" in url:
+    # Give top priority to Master playlists & manifests
+    if "master" in kind or "master" in url or "playlist.m3u8" in url or "manifest.mpd" in url:
         score += 60
     elif "playlist" in url or "media.m3u8" in url:
         score += 20
@@ -273,6 +246,7 @@ def rank_capture(record: dict[str, Any]) -> int:
     if record.get("bandwidth"):
         score += 10
 
+    # Penalize segment chunks
     if is_segment_chunk(url):
         score -= 80
 
