@@ -10,8 +10,8 @@ import webbrowser
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import Qt, QThread, Signal
-from PySide6.QtGui import QAction, QCloseEvent
+from PySide6.QtCore import Qt, QThread, Signal, QTimer, QUrl
+from PySide6.QtGui import QAction, QCloseEvent, QDesktopServices
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QGroupBox,
     QComboBox,
+    QProgressBar,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -41,7 +42,7 @@ from .stream_tester import test_hls_record
 from .download_engine import download_record
 
 APP_NAME = "M3U8 Sniffer TV"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 
 TABLE_COLUMNS = [
     "ID",
@@ -55,6 +56,10 @@ TABLE_COLUMNS = [
     "M3U8 URL",
     "Page URL",
     "Referer",
+    "Validation",
+    "FPS",
+    "Codec",
+    "Audio",
 ]
 
 
@@ -64,7 +69,7 @@ class BatchTestThread(QThread):
 
     def __init__(self, records: list[dict[str, Any]], parent: Any = None) -> None:
         super().__init__(parent)
-        self.records = list(records)
+        self.records = [dict(record) for record in records]
 
     def run(self) -> None:
         tested_count = 0
@@ -81,6 +86,7 @@ class BatchTestThread(QThread):
 
 class DownloadThread(QThread):
     progress_signal = Signal(str)
+    metrics_signal = Signal(dict)
     finished_signal = Signal(bool, str)
 
     def __init__(self, record: dict[str, Any], output_path: str, parent: Any = None) -> None:
@@ -90,7 +96,7 @@ class DownloadThread(QThread):
 
     def run(self) -> None:
         try:
-            download_record(self.record, self.output_path, self.progress_signal.emit, self.isInterruptionRequested)
+            download_record(self.record, self.output_path, self.progress_signal.emit, self.isInterruptionRequested, self.metrics_signal.emit)
             self.finished_signal.emit(True, "Download completed successfully!")
         except Exception as exc:
             self.finished_signal.emit(False, f"Download stopped: {exc}")
@@ -108,6 +114,10 @@ class MainWindow(QMainWindow):
         self.records: list[dict[str, Any]] = []
         self.record_index: dict[str, int] = {}
         self.capture_enabled = True
+        self.auto_thread = None
+        self.validation_pending = {}
+        self.validation_epoch = 0
+        self.last_download_folder = None
 
         data_dir = Path(os.environ.get("LOCALAPPDATA", str(Path.home() / ".local" / "share"))) / "M3U8SnifferTV"
         data_dir.mkdir(parents=True, exist_ok=True)
@@ -117,6 +127,9 @@ class MainWindow(QMainWindow):
             handler = RotatingFileHandler(data_dir / "app.log", maxBytes=1_000_000, backupCount=3, encoding="utf-8")
             self.logger.addHandler(handler)
         self._build_ui()
+        self.auto_timer = QTimer(self)
+        self.auto_timer.timeout.connect(self.start_auto_validation)
+        self.auto_timer.start(500)
         self._build_menu()
         self._apply_style()
         self._log("Ready. Paste a video page URL and click Open Browser.")
@@ -231,6 +244,28 @@ class MainWindow(QMainWindow):
         action_row.addWidget(self.cancel_button)
         action_row.addStretch(1)
         root_layout.addLayout(action_row)
+
+        choices = QHBoxLayout()
+        self.page_filter = QComboBox()
+        self.page_filter.addItem("All source pages", "")
+        self.page_filter.currentIndexChanged.connect(self.apply_page_filter)
+        choices.addWidget(QLabel("Video/page group:"))
+        choices.addWidget(self.page_filter, 1)
+        self.refresh_button = QPushButton("Refresh Stream")
+        self.refresh_button.clicked.connect(self.refresh_stream)
+        choices.addWidget(self.refresh_button)
+        self.output_combo = QComboBox()
+        self.output_combo.addItems(["Video MP4", "Audio only MP3"])
+        choices.addWidget(self.output_combo)
+        self.folder_button = QPushButton("Open Download Folder")
+        self.folder_button.clicked.connect(self.open_download_folder)
+        choices.addWidget(self.folder_button)
+        root_layout.addLayout(choices)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        root_layout.addWidget(self.progress_bar)
+        self.progress_label = QLabel("No download running")
+        root_layout.addWidget(self.progress_label)
 
         splitter = QSplitter(Qt.Orientation.Vertical)
         root_layout.addWidget(splitter, 1)
@@ -396,6 +431,8 @@ class MainWindow(QMainWindow):
             index = self.record_index[record_id]
             existing = self.records[index]
             merged = self._merge_records(existing, record)
+            if existing.get("validation_state") == "Awaiting recapture":
+                merged["validation_state"] = "Untested"
             self.records[index] = merged
             row = self._find_row_by_id(record_id)
             if row is not None:
@@ -412,6 +449,102 @@ class MainWindow(QMainWindow):
 
         self.table.setSortingEnabled(True)
         self._sort_best_first()
+        page = record.get("source_page", "")
+        if page and self.page_filter.findData(page) < 0:
+            self.page_filter.addItem(page, page)
+        self.apply_page_filter()
+        current = self.records[self.record_index[record_id]]
+        if current.get("validation_state", "Untested") == "Untested":
+            self.validation_pending[record_id] = dict(current)
+
+    def variant_summary(self, record, key):
+        values = list(dict.fromkeys(str(v[key]) for v in record.get("variants", []) if v.get(key)))
+        return ", ".join(values) or "Unknown"
+
+    def apply_page_filter(self):
+        page = self.page_filter.currentData()
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 9)
+            self.table.setRowHidden(row, bool(page and item and item.text() != page))
+
+    def start_auto_validation(self):
+        if self.auto_thread and self.auto_thread.isRunning():
+            return
+        if not self.validation_pending:
+            return
+        records = list(self.validation_pending.values())
+        self.validation_pending.clear()
+        epoch = self.validation_epoch
+        self.auto_thread = BatchTestThread(records, parent=self)
+        self.auto_thread.record_tested.connect(lambda record, result: self.apply_validation(record, result, epoch))
+        self.auto_thread.start()
+
+    def apply_validation(self, record, result, epoch=None):
+        if epoch is not None and epoch != self.validation_epoch:
+            return
+        index = self.record_index.get(record.get("id"))
+        if index is None:
+            return
+        current = self.records[index]
+        if current.get("validation_revision", 0) != record.get("validation_revision", 0):
+            return
+        state = "Validated" if result.get("ok") else "Expired / denied" if result.get("status_code") in {401, 403, 410} else "Failed"
+        current["validation_state"] = state
+        current["validation_result"] = result
+        for key in ("variants", "audio", "resolution", "bandwidth", "playlist_type"):
+            if result.get(key):
+                current[key] = result[key]
+        from .hls_utils import rank_capture
+        current["score"] = rank_capture(current) + (200 if result.get("ok") else -200)
+        self.table.setSortingEnabled(False)
+        row = self._find_row_by_id(current["id"])
+        if row is not None:
+            self._populate_row(row, current)
+        self.table.setSortingEnabled(True)
+        self._sort_best_first()
+        self.selection_changed()
+
+    def refresh_stream(self):
+        record = self.selected_record()
+        page = (record or {}).get("source_page") or self.page_filter.currentData() or self.url_input.text().strip()
+        if not page:
+            QMessageBox.warning(self, "Missing source page", "Select a capture or enter its source page URL.")
+            return
+        for current in self.records:
+            if current.get("source_page") == page:
+                self.validation_pending.pop(current["id"], None)
+                current["validation_state"] = "Awaiting recapture"
+                current["score"] = -200
+                current["validation_revision"] = current.get("validation_revision", 0) + 1
+                row = self._find_row_by_id(current["id"])
+                if row is not None:
+                    self.table.setSortingEnabled(False)
+                    self._populate_row(row, current)
+                    self.table.setSortingEnabled(True)
+        self.url_input.setText(page)
+        self.set_capture(True)
+        if self.browser_thread and self.browser_thread.isRunning():
+            self.browser_thread.reset_captures()
+        self.open_browser_clicked()
+        self._log("Revisiting source page. Start playback or sign in manually if needed; replacement streams appear as new captures.")
+
+    def open_download_folder(self):
+        if self.last_download_folder:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.last_download_folder)))
+        else:
+            self._log("No download folder selected yet.")
+
+    def show_download_progress(self, metrics):
+        downloaded = metrics.get("downloaded_bytes") or 0
+        total = metrics.get("total_bytes") or metrics.get("total_bytes_estimate") or 0
+        self.progress_bar.setRange(0, 100 if total else 0)
+        if total:
+            self.progress_bar.setValue(min(100, int(downloaded * 100 / total)))
+        speed = metrics.get("speed") or 0
+        eta = metrics.get("eta")
+        self.progress_label.setText(f"{downloaded / 1048576:.1f} MB / {total / 1048576:.1f} MB | {speed / 1048576:.2f} MB/s | ETA {eta if eta is not None else '?'} s")
+        if metrics.get("status") == "finished":
+            self.progress_label.setText("Processing output...")
 
     def _merge_records(self, old: dict[str, Any], new: dict[str, Any]) -> dict[str, Any]:
         merged = dict(old)
@@ -425,6 +558,9 @@ class MainWindow(QMainWindow):
                     merged[key] = value
                 elif not old.get(key) or key in {"status_code", "content_type", "playlist_type", "resolution", "bandwidth", "response_headers", "request_headers", "headers_needed", "variants", "event_source", "captured_at"}:
                     merged[key] = value
+        if merged.get("validation_result") and merged.get("validation_state") != "Untested":
+            from .hls_utils import rank_capture
+            merged["score"] = rank_capture(merged) + (200 if merged["validation_result"].get("ok") else -200)
         return merged
 
     def _find_row_by_id(self, record_id: str) -> int | None:
@@ -447,6 +583,10 @@ class MainWindow(QMainWindow):
             record.get("m3u8_url", ""),
             record.get("source_page", ""),
             record.get("referer", ""),
+            record.get("validation_state", "Untested"),
+            self.variant_summary(record, "fps"),
+            self.variant_summary(record, "codecs"),
+            record.get("audio", "Unknown"),
         ]
         for column, value in enumerate(values):
             item = QTableWidgetItem(value)
@@ -461,7 +601,11 @@ class MainWindow(QMainWindow):
     def selection_changed(self) -> None:
         record = self.selected_record()
         if record:
-            self.details_box.setPlainText(json.dumps(record, indent=2, ensure_ascii=False))
+            variants = record.get("variants", [])
+            summary = [f"Source page: {record.get('source_page', '')}", f"Stream: {record.get('playlist_type', '')} | {record.get('validation_state', 'Untested')}"]
+            for variant in variants:
+                summary.append(f"• {variant.get('resolution') or 'Unknown resolution'} | {variant.get('fps') or '?'} FPS | {variant.get('codecs') or 'Unknown codec'} | audio group: {variant.get('audio_group') or 'Unknown'}")
+            self.details_box.setPlainText("\n".join(summary) + "\n\n" + json.dumps(record, indent=2, ensure_ascii=False))
 
     def selected_record(self) -> dict[str, Any] | None:
         selected = self.table.selectionModel().selectedRows()
@@ -514,8 +658,8 @@ class MainWindow(QMainWindow):
         save_path, _ = QFileDialog.getSaveFileName(
             self,
             "Save Video File",
-            "video.mp4",
-            "MP4 Files (*.mp4);;All Files (*.*)"
+            "audio.mp3" if self.output_combo.currentIndex() else "video.mp4",
+            "MP3 Files (*.mp3)" if self.output_combo.currentIndex() else "MP4 Files (*.mp4)"
         )
         if not save_path:
             return
@@ -524,9 +668,14 @@ class MainWindow(QMainWindow):
         self.download_button.setEnabled(False)
         self.statusBar().showMessage("Downloading video with yt-dlp...")
 
+        self.last_download_folder = Path(save_path).parent
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
         download_record_data = dict(record)
+        download_record_data["audio_only"] = bool(self.output_combo.currentIndex())
         download_record_data["max_height"] = [None, 1080, 720, 480][self.quality_combo.currentIndex()]
         self.download_thread = DownloadThread(download_record_data, save_path, parent=self)
+        self.download_thread.metrics_signal.connect(self.show_download_progress)
         self.download_thread.progress_signal.connect(self._log)
         self.download_thread.finished_signal.connect(self._on_download_finished)
         self.download_thread.start()
@@ -537,6 +686,10 @@ class MainWindow(QMainWindow):
             self._log("Download cancellation requested.")
 
     def _on_download_finished(self, success: bool, message: str) -> None:
+        self.progress_bar.setRange(0, 100)
+        if success:
+            self.progress_bar.setValue(100)
+        self.progress_label.setText(message)
         self.download_button.setEnabled(True)
         self.statusBar().showMessage(message)
         self._log(message)
@@ -556,7 +709,7 @@ class MainWindow(QMainWindow):
         self.test_button.setEnabled(False)
         self.test_all_button.setEnabled(False)
         self.batch_thread = BatchTestThread([record], parent=self)
-        self.batch_thread.record_tested.connect(lambda rec, result: self.show_test_result(result))
+        self.batch_thread.record_tested.connect(lambda rec, result: (self.apply_validation(rec, result), self.show_test_result(result)))
         self.batch_thread.finished_all.connect(self._on_batch_finished)
         self.batch_thread.start()
 
@@ -592,6 +745,7 @@ class MainWindow(QMainWindow):
         self.batch_thread.start()
 
     def _on_record_tested(self, record: dict[str, Any], result: dict[str, Any]) -> None:
+        self.apply_validation(record, result)
         record_id = record.get("id") or record.get("m3u8_url")
         row = self._find_row_by_id(record_id) if record_id else None
 
@@ -637,6 +791,10 @@ class MainWindow(QMainWindow):
     def clear_clicked(self) -> None:
         if self.browser_thread and self.browser_thread.isRunning():
             self.browser_thread.reset_captures()
+        self.validation_epoch += 1
+        self.validation_pending.clear()
+        self.page_filter.clear()
+        self.page_filter.addItem("All source pages", "")
         self.records.clear()
         self.record_index.clear()
         self.table.setRowCount(0)
@@ -659,7 +817,8 @@ class MainWindow(QMainWindow):
         self.logger.info(safe_message)
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        workers = [self.browser_thread, self.batch_thread, self.download_thread]
+        self.auto_timer.stop()
+        workers = [self.browser_thread, self.batch_thread, self.download_thread, self.auto_thread]
         if self.browser_thread and self.browser_thread.isRunning():
             self.browser_thread.close_browser()
         for worker in workers:

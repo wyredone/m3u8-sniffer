@@ -115,3 +115,50 @@ class RegressionTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+class StreamFeatureTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_validation_retained_and_ranks_above_failed(self):
+        w = MainWindow()
+        first = make_capture_record(m3u8_url='https://example.org/a.m3u8', source_page='https://example.org/video1')
+        second = make_capture_record(m3u8_url='https://example.org/master.m3u8', source_page='https://example.org/video2')
+        w.add_or_update_record(first); w.add_or_update_record(second)
+        w.apply_validation(first, {'ok':True, 'status_code':200, 'audio':'Separate audio'})
+        w.apply_validation(second, {'ok':False, 'status_code':403})
+        self.assertGreater(w.records[0]['score'], w.records[1]['score'])
+        self.assertEqual(w.records[1]['validation_state'], 'Expired / denied')
+        w.add_or_update_record(dict(second, score=999))
+        self.assertLess(w.records[1]['score'], w.records[0]['score'])
+        w.page_filter.setCurrentIndex(w.page_filter.findData(first['source_page']))
+        self.assertTrue(w.table.isRowHidden(w._find_row_by_id(second['id'])))
+        w.close()
+
+    def test_stale_validation_is_ignored(self):
+        w = MainWindow()
+        record = make_capture_record(m3u8_url='https://example.org/a.m3u8')
+        w.add_or_update_record(record)
+        w.records[0]['validation_revision'] = 1
+        w.apply_validation(dict(record, validation_revision=0), {'ok':True})
+        self.assertNotIn('validation_result', w.records[0])
+        w.clear_clicked()
+        w.apply_validation(record, {'ok':True}, w.validation_epoch-1)
+        self.assertFalse(w.records)
+        w.close()
+
+    def test_download_metrics(self):
+        w = MainWindow()
+        w.show_download_progress({'downloaded_bytes':50,'total_bytes':100,'speed':10,'eta':5})
+        self.assertEqual(w.progress_bar.value(),50)
+        w.show_download_progress({'downloaded_bytes':10})
+        self.assertEqual(w.progress_bar.maximum(),0)
+        w.close()
+
+    def test_audio_only_download_options(self):
+        with patch('yt_dlp.YoutubeDL') as cls, patch('shutil.which', return_value='/usr/bin/ffmpeg'):
+            download_record({'m3u8_url':'https://example.org/a.m3u8','audio_only':True},'audio.mp3',lambda x:None,lambda:False)
+            options=cls.call_args.args[0]
+            self.assertEqual(options['format'],'bestaudio/best')
+            self.assertEqual(options['postprocessors'][0]['preferredcodec'],'mp3')

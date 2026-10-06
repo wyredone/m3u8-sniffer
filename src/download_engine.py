@@ -13,7 +13,7 @@ def session_headers(record: dict[str, Any]) -> dict[str, str]:
             headers[k] = v
     return headers
 
-def download_record(record: dict[str, Any], output_path: str, progress: Callable[[str], None], cancelled: Callable[[], bool]) -> None:
+def download_record(record: dict[str, Any], output_path: str, progress: Callable[[str], None], cancelled: Callable[[], bool], metrics: Callable[[dict], None] | None = None) -> None:
     import yt_dlp
     import shutil
     import sys
@@ -22,6 +22,8 @@ def download_record(record: dict[str, Any], output_path: str, progress: Callable
     if not shutil.which("ffmpeg") and not (ffmpeg_dir / "ffmpeg.exe").exists():
         raise RuntimeError("FFmpeg is required for MP4 output. Install FFmpeg and add it to PATH, or place ffmpeg.exe beside the app executable.")
     def hook(info):
+        if metrics:
+            metrics({k: info.get(k) for k in ("status", "downloaded_bytes", "total_bytes", "total_bytes_estimate", "speed", "eta")})
         if cancelled():
             raise DownloadCancelled("Download cancelled.")
         if info.get("status") == "downloading":
@@ -43,6 +45,9 @@ def download_record(record: dict[str, Any], output_path: str, progress: Callable
                "postprocessors": [{"key": "FFmpegVideoRemuxer", "preferedformat": "mp4"}],
                "progress_hooks": [hook], "socket_timeout": 15, "retries": 3,
                "quiet": True, "noprogress": True, "concurrent_fragment_downloads": 5}
+    if record.get("audio_only"):
+        options["format"] = "bestaudio/best"
+        options["postprocessors"] = [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}]
     if (ffmpeg_dir / "ffmpeg.exe").exists():
         options["ffmpeg_location"] = str(ffmpeg_dir)
     if cancelled():

@@ -135,3 +135,11 @@ Automatic CLI (headless; pages requiring manual interaction may not start playba
 ```bat
 python -m src.auto_downloader "https://example.com/video-page"
 ```
+
+## Stream and download controls in 1.2.0
+
+- Use Video/page group to filter captures to their source page. Rows show playlist type, validation, FPS, codec, and known separate audio. Unknown metadata is labeled Unknown. Selected details include the master playlist's variant resolutions and URLs.
+- New captures are automatically validated in a background worker. Validated responses rank above failed and untested URLs; this confirms manifest/media response validity, not full playback or DRM compatibility. Validation results are retained in exports.
+- The download progress bar shows transferred MB, speed, and ETA. Unknown totals use an indeterminate bar. Separate video/audio downloads can reset progress between components.
+- Select Video MP4 or Audio only MP3, and use Open Download Folder after choosing an output location. FFmpeg is required for either output.
+- Refresh Stream revisits the selected capture's source page and resets response deduplication. Old entries wait for recapture and replacement signed URLs appear as new entries. Start playback or complete login manually if needed. The app does not automatically resume a failed download.

@@ -31,6 +31,11 @@ def test_hls_record(record: dict[str, Any], timeout: int = 15) -> dict[str, Any]
                 valid = "ftyp" in text[:64] or bytes(sample[:4]) == b"\x1a\x45\xdf\xa3"
             result.update(ok=response.ok and valid, status_code=response.status_code, content_type=content_type,
                           playlist_type=kind, resolution=extract_resolution(text), bandwidth=extract_bandwidth(text), sample=text[:1000])
+            if looks_like_hls_text(text):
+                import m3u8
+                manifest = m3u8.loads(text, uri=response.url)
+                result["variants"] = [{"url": v.absolute_uri, "resolution": "x".join(map(str, v.stream_info.resolution or ())), "fps": v.stream_info.frame_rate, "codecs": v.stream_info.codecs, "audio_group": v.stream_info.audio} for v in manifest.playlists]
+                result["audio"] = "Separate audio" if any(m.type == "AUDIO" for m in manifest.media) else "Unknown"
             result["message"] = f"Validated {kind} response." if result["ok"] else f"HTTP {response.status_code}: stream could not be validated; it may be expired or require session credentials."
     except Exception as exc:
         result["message"] = f"Test failed: {exc}"
