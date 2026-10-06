@@ -24,7 +24,7 @@ EXPORT_COLUMNS = [
 
 
 def export_json(records: list[dict[str, Any]], path: str | Path) -> None:
-    Path(path).write_text(json.dumps(records, indent=2, ensure_ascii=False), encoding="utf-8")
+    Path(path).write_text(json.dumps([{k: v for k, v in record.items() if k not in {"request_headers", "response_headers"}} for record in records], indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 def export_csv(records: list[dict[str, Any]], path: str | Path) -> None:

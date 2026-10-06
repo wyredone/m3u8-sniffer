@@ -1,0 +1,13 @@
+browser_profile/
+browser_state.json
+__pycache__/
+*.py[cod]
+nppBackup/
+*.bk
+*.bak
+.venv/
+build/
+dist/
+*.spec
+.playwright_browser_checked
+src/new.txt

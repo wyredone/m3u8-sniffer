@@ -7,8 +7,8 @@ from typing import Any
 
 def win_quote(value: str) -> str:
     value = value or ""
-    escaped = value.replace('"', '\\"')
-    return f'"{escaped}"'
+    return "'" + value.replace("'", "''") + "'"
+
 
 
 def safe_filename_from_url(url: str, default: str = "captured_stream.mp4") -> str:
@@ -59,7 +59,7 @@ def build_ffmpeg_command(record: dict[str, Any]) -> str:
     if user_agent:
         args.extend(["-user_agent", win_quote(user_agent)])
     if header_lines:
-        args.extend(["-headers", win_quote("\\r\\n".join(header_lines) + "\\r\\n")])
+        args.extend(["-headers", '(' + win_quote('\n'.join(header_lines) + '\n') + ' -replace "`n", "`r`n")'])
     args.extend(["-i", win_quote(url), "-c", "copy", win_quote(output_file)])
     return " ".join(args)
 
@@ -70,7 +70,7 @@ def build_vlc_command(record: dict[str, Any], vlc_path: str = "vlc") -> str:
     referer = headers.get("Referer") or record.get("referer") or record.get("source_page")
     user_agent = headers.get("User-Agent") or record.get("user_agent")
 
-    args = [win_quote(vlc_path) if Path(vlc_path).suffix.lower() == ".exe" else vlc_path]
+    args = ["&", win_quote(vlc_path)]
     if referer:
         args.append(f":http-referrer={win_quote(referer)}")
     if user_agent:

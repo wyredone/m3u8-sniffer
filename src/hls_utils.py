@@ -55,7 +55,7 @@ def url_fingerprint(url: str) -> str:
 
 
 def is_segment_chunk(url: str) -> bool:
-    lowered = (url or "").lower()
+    lowered = urlparse(url or "").path.lower()
     return (
         "range=" in lowered
         or "/range/" in lowered
@@ -131,7 +131,7 @@ def content_type_is_hls(content_type: str | None) -> bool:
     if not content_type:
         return False
     main_type = content_type.split(";", 1)[0].strip().lower()
-    if main_type in MEDIA_MIME_TYPES:
+    if main_type in {"application/vnd.apple.mpegurl", "application/x-mpegurl", "audio/mpegurl", "audio/x-mpegurl", "application/mpegurl"}:
         return True
     return "mpegurl" in main_type or "m3u8" in main_type
 
@@ -169,7 +169,9 @@ def detect_stream_format(url: str, content_type: str = "") -> str:
     if clean_url.endswith(".sdp"):
         return "SDP Session"
 
-    return "HLS"
+    if clean_url.endswith(".m3u8") or "mpegurl" in ct or "m3u8" in clean_url:
+        return "HLS"
+    return "Unknown"
 
 
 def looks_like_hls_text(text: str | bytes | None) -> bool:
@@ -183,6 +185,8 @@ def looks_like_hls_text(text: str | bytes | None) -> bool:
 
 def playlist_kind(text: str | None, url: str = "", content_type: str = "") -> str:
     stream_fmt = detect_stream_format(url, content_type)
+    if looks_like_hls_text(text):
+        stream_fmt = "HLS"
     if stream_fmt != "HLS":
         return stream_fmt
 

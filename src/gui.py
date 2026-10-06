@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import json
+import logging
+from logging.handlers import RotatingFileHandler
+import os
+import re
 import subprocess
 import webbrowser
 from pathlib import Path
@@ -14,6 +18,7 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QGridLayout,
     QGroupBox,
+    QComboBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -33,9 +38,10 @@ from .browser_worker import BrowserThread
 from .command_utils import build_ffmpeg_command, build_vlc_command, build_ytdlp_command
 from .export_utils import export_csv, export_json
 from .stream_tester import test_hls_record
+from .download_engine import download_record
 
 APP_NAME = "M3U8 Sniffer TV"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 
 TABLE_COLUMNS = [
     "ID",
@@ -63,6 +69,8 @@ class BatchTestThread(QThread):
     def run(self) -> None:
         tested_count = 0
         for record in self.records:
+            if self.isInterruptionRequested():
+                break
             if not record.get("m3u8_url"):
                 continue
             res = test_hls_record(record, timeout=8)
@@ -81,40 +89,11 @@ class DownloadThread(QThread):
         self.output_path = output_path
 
     def run(self) -> None:
-        m3u8_url = self.record.get("m3u8_url", "")
-        headers_needed = self.record.get("headers_needed", {}) or {}
-        referer = headers_needed.get("Referer") or self.record.get("referer") or self.record.get("source_page", "")
-        user_agent = headers_needed.get("User-Agent") or self.record.get("user_agent", "")
-
-        cmd = ["yt-dlp", m3u8_url, "-o", self.output_path]
-        if referer:
-            cmd.extend(["--add-header", f"Referer:{referer}"])
-        if user_agent:
-            cmd.extend(["--add-header", f"User-Agent:{user_agent}"])
-
         try:
-            self.progress_signal.emit(f"Running download command:\n{' '.join(cmd)}\n")
-            process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                creationflags=subprocess.CREATE_NO_WINDOW if subprocess.os.name == "nt" else 0
-            )
-
-            if process.stdout:
-                for line in process.stdout:
-                    self.progress_signal.emit(line.strip())
-
-            process.wait()
-            if process.returncode == 0:
-                self.finished_signal.emit(True, "Download completed successfully!")
-            else:
-                self.finished_signal.emit(False, f"yt-dlp failed with exit code {process.returncode}")
-        except FileNotFoundError:
-            self.finished_signal.emit(False, "yt-dlp is not installed or not in PATH. Please install yt-dlp.")
+            download_record(self.record, self.output_path, self.progress_signal.emit, self.isInterruptionRequested)
+            self.finished_signal.emit(True, "Download completed successfully!")
         except Exception as exc:
-            self.finished_signal.emit(False, f"Download error: {exc}")
+            self.finished_signal.emit(False, f"Download stopped: {exc}")
 
 
 class MainWindow(QMainWindow):
@@ -130,6 +109,13 @@ class MainWindow(QMainWindow):
         self.record_index: dict[str, int] = {}
         self.capture_enabled = True
 
+        data_dir = Path(os.environ.get("LOCALAPPDATA", str(Path.home() / ".local" / "share"))) / "M3U8SnifferTV"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        self.logger = logging.getLogger("m3u8_sniffer")
+        self.logger.setLevel(logging.INFO)
+        if not self.logger.handlers:
+            handler = RotatingFileHandler(data_dir / "app.log", maxBytes=1_000_000, backupCount=3, encoding="utf-8")
+            self.logger.addHandler(handler)
         self._build_ui()
         self._build_menu()
         self._apply_style()
@@ -190,6 +176,9 @@ class MainWindow(QMainWindow):
         root_layout.addLayout(url_row)
 
         action_row = QHBoxLayout()
+        self.quality_combo = QComboBox()
+        self.quality_combo.addItems(["Best quality", "Up to 1080p", "Up to 720p", "Up to 480p"])
+        action_row.addWidget(self.quality_combo)
         self.download_button = QPushButton("Download Video")
         self.download_button.clicked.connect(self.download_video_clicked)
 
@@ -237,6 +226,9 @@ class MainWindow(QMainWindow):
             self.clear_button,
         ]:
             action_row.addWidget(button)
+        self.cancel_button = QPushButton("Cancel Download")
+        self.cancel_button.clicked.connect(self.cancel_download)
+        action_row.addWidget(self.cancel_button)
         action_row.addStretch(1)
         root_layout.addLayout(action_row)
 
@@ -359,6 +351,7 @@ class MainWindow(QMainWindow):
 
         profile_dir = str(Path.cwd() / "browser_profile")
         self.browser_thread = BrowserThread(start_url=url, profile_dir=profile_dir)
+        self.browser_thread.capture_enabled = self.capture_enabled
         self.browser_thread.stream_detected.connect(self.add_or_update_record)
         self.browser_thread.status_changed.connect(self.on_status)
         self.browser_thread.error_reported.connect(self.on_error)
@@ -398,6 +391,7 @@ class MainWindow(QMainWindow):
         if not record_id:
             return
 
+        self.table.setSortingEnabled(False)
         if record_id in self.record_index:
             index = self.record_index[record_id]
             existing = self.records[index]
@@ -416,17 +410,20 @@ class MainWindow(QMainWindow):
             self.table.setSortingEnabled(True)
             self._log(f"Captured HLS: {record.get('playlist_type', '')} | {record.get('m3u8_url', '')}")
 
+        self.table.setSortingEnabled(True)
         self._sort_best_first()
 
     def _merge_records(self, old: dict[str, Any], new: dict[str, Any]) -> dict[str, Any]:
         merged = dict(old)
         for key, value in new.items():
+            if new.get("event_source") == "request" and key in {"playlist_type", "content_type", "resolution", "bandwidth"} and old.get("event_source") == "response":
+                continue
             if value not in (None, "", [], {}):
                 if key == "score":
                     merged[key] = max(int(old.get("score") or 0), int(value or 0))
                 elif key == "playlist_sample" and len(str(value)) > len(str(old.get(key, ""))):
                     merged[key] = value
-                elif not old.get(key) or key in {"status_code", "content_type", "playlist_type", "resolution", "bandwidth", "response_headers"}:
+                elif not old.get(key) or key in {"status_code", "content_type", "playlist_type", "resolution", "bandwidth", "response_headers", "request_headers", "headers_needed", "variants", "event_source", "captured_at"}:
                     merged[key] = value
         return merged
 
@@ -498,7 +495,7 @@ class MainWindow(QMainWindow):
 
     def copy_ffmpeg_clicked(self) -> None:
         record = self.selected_record()
-        self.copy_to_clipboard(build_ffmpeg_command(record) if record else "", "FFmpeg command")
+        self.copy_to_clipboard(build_ffmpeg_command(record) if record else "", "PowerShell FFmpeg command")
 
     def copy_vlc_clicked(self) -> None:
         record = self.selected_record()
@@ -527,10 +524,17 @@ class MainWindow(QMainWindow):
         self.download_button.setEnabled(False)
         self.statusBar().showMessage("Downloading video with yt-dlp...")
 
-        self.download_thread = DownloadThread(record, save_path, parent=self)
+        download_record_data = dict(record)
+        download_record_data["max_height"] = [None, 1080, 720, 480][self.quality_combo.currentIndex()]
+        self.download_thread = DownloadThread(download_record_data, save_path, parent=self)
         self.download_thread.progress_signal.connect(self._log)
         self.download_thread.finished_signal.connect(self._on_download_finished)
         self.download_thread.start()
+
+    def cancel_download(self) -> None:
+        if self.download_thread and self.download_thread.isRunning():
+            self.download_thread.requestInterruption()
+            self._log("Download cancellation requested.")
 
     def _on_download_finished(self, success: bool, message: str) -> None:
         self.download_button.setEnabled(True)
@@ -547,13 +551,16 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "No selection", "Select a captured M3U8 row first.")
             return
 
-        self._log("Testing selected playlist...")
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        try:
-            result = test_hls_record(record)
-        finally:
-            QApplication.restoreOverrideCursor()
+        if self.batch_thread and self.batch_thread.isRunning():
+            return
+        self.test_button.setEnabled(False)
+        self.test_all_button.setEnabled(False)
+        self.batch_thread = BatchTestThread([record], parent=self)
+        self.batch_thread.record_tested.connect(lambda rec, result: self.show_test_result(result))
+        self.batch_thread.finished_all.connect(self._on_batch_finished)
+        self.batch_thread.start()
 
+    def show_test_result(self, result: dict[str, Any]) -> None:
         self.test_status_label.setText("OK" if result.get("ok") else "FAILED / NEEDS SESSION")
         self.test_http_label.setText(str(result.get("status_code") or ""))
         self.test_type_label.setText(result.get("playlist_type") or "")
@@ -569,6 +576,8 @@ class MainWindow(QMainWindow):
         self._log(result.get("message", "Test complete."))
 
     def test_all_playlists_clicked(self) -> None:
+        if self.batch_thread and self.batch_thread.isRunning():
+            return
         if not self.records:
             QMessageBox.information(self, "No records", "No captured streams to test.")
             return
@@ -595,6 +604,7 @@ class MainWindow(QMainWindow):
                 status_item.setText(f"{result.get('status_code', '')} ({'✓' if result.get('ok') else '✗'})")
 
     def _on_batch_finished(self, count: int) -> None:
+        self.test_button.setEnabled(True)
         self.test_all_button.setEnabled(True)
         self.statusBar().showMessage(f"Batch validation complete. Tested {count} streams.")
         self._log(f"Batch validation finished ({count} streams checked).")
@@ -625,6 +635,8 @@ class MainWindow(QMainWindow):
             self._log(f"Exported CSV: {path}")
 
     def clear_clicked(self) -> None:
+        if self.browser_thread and self.browser_thread.isRunning():
+            self.browser_thread.reset_captures()
         self.records.clear()
         self.record_index.clear()
         self.table.setRowCount(0)
@@ -642,16 +654,23 @@ class MainWindow(QMainWindow):
         )
 
     def _log(self, message: str) -> None:
-        self.log_box.appendPlainText(message)
+        safe_message = re.sub(r"(https?://[^\s?]+)\?[^\s]+", r"\1?[redacted]", message)
+        self.log_box.appendPlainText(safe_message)
+        self.logger.info(safe_message)
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        workers = [self.browser_thread, self.batch_thread, self.download_thread]
         if self.browser_thread and self.browser_thread.isRunning():
             self.browser_thread.close_browser()
-            self.browser_thread.wait(3000)
-        if self.batch_thread and self.batch_thread.isRunning():
-            self.batch_thread.wait(3000)
-        if self.download_thread and self.download_thread.isRunning():
-            self.download_thread.wait(3000)
+        for worker in workers:
+            if worker and worker.isRunning():
+                worker.requestInterruption()
+        if any(worker and worker.isRunning() for worker in workers):
+            from PySide6.QtCore import QTimer
+            event.ignore()
+            self.statusBar().showMessage("Stopping background work before closing...")
+            QTimer.singleShot(250, self.close)
+            return
         event.accept()
 
 

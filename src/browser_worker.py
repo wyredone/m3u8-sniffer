@@ -5,6 +5,7 @@ import os
 import queue
 import re
 import traceback
+import time
 from pathlib import Path
 from typing import Any
 
@@ -47,42 +48,19 @@ def is_ad_domain(url: str) -> bool:
 
 
 def parse_m3u8_variants(playlist_text: str) -> list[dict[str, Any]]:
-    variants: list[dict[str, Any]] = []
-    if not playlist_text or "#EXT-X-STREAM-INF" not in playlist_text:
-        return variants
-
-    lines = playlist_text.splitlines()
-    for i, line in enumerate(lines):
-        if line.startswith("#EXT-X-STREAM-INF:"):
-            info: dict[str, Any] = {}
-
-            res_match = re.search(r"RESOLUTION=(\d+x\d+)", line)
-            if res_match:
-                info["resolution"] = res_match.group(1)
-                try:
-                    _, h = map(int, res_match.group(1).split("x"))
-                    info["quality_label"] = f"{h}p"
-                except Exception:
-                    pass
-
-            bw_match = re.search(r"BANDWIDTH=(\d+)", line)
-            if bw_match:
-                info["bandwidth"] = int(bw_match.group(1))
-
-            codec_match = re.search(r'CODECS="([^"]+)"', line)
-            if codec_match:
-                info["codecs"] = codec_match.group(1)
-
-            fps_match = re.search(r"FRAME-RATE=([\d.]+)", line)
-            if fps_match:
-                info["fps"] = float(fps_match.group(1))
-
-            if i + 1 < len(lines):
-                next_line = lines[i + 1].strip()
-                if next_line and not next_line.startswith("#"):
-                    info["url"] = next_line
-
+    import m3u8
+    variants = []
+    try:
+        manifest = m3u8.loads(playlist_text)
+        for playlist in manifest.playlists:
+            stream = playlist.stream_info
+            info = {"url": playlist.uri, "bandwidth": stream.bandwidth, "codecs": stream.codecs, "fps": stream.frame_rate}
+            if stream.resolution:
+                width, height = stream.resolution
+                info.update(resolution=f"{width}x{height}", quality_label=f"{height}p")
             variants.append(info)
+    except Exception:
+        pass
     return variants
 
 
@@ -96,7 +74,9 @@ class BrowserThread(QThread):
         super().__init__(parent)
         self.start_url = start_url.strip()
         self.profile_dir = profile_dir or str(Path.cwd() / "browser_profile")
-        self.state_file = Path.cwd() / "browser_state.json"
+        data_dir = Path(os.environ.get("LOCALAPPDATA", str(Path.home() / ".local" / "share"))) / "M3U8SnifferTV"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        self.state_file = data_dir / "browser_state.json"
         self.command_queue: queue.Queue[tuple[str, Any]] = queue.Queue()
         self.capture_enabled = True
         self.block_heavy_resources = False
@@ -106,7 +86,7 @@ class BrowserThread(QThread):
         self._context: BrowserContext | None = None
         self._active_page: Page | None = None
         self._page_user_agents: dict[int, str] = {}
-        self._seen_response_ids: set[str] = set()
+        self._seen_response_ids: dict[str, float] = {}
 
     def open_url(self, url: str) -> None:
         self.command_queue.put(("open_url", url.strip()))
@@ -118,7 +98,11 @@ class BrowserThread(QThread):
         self.command_queue.put(("block_resources", bool(enabled)))
 
     def close_browser(self) -> None:
+        self.stop_requested = True
         self.command_queue.put(("close", None))
+
+    def reset_captures(self) -> None:
+        self.command_queue.put(("reset", None))
 
     def run(self) -> None:
         try:
@@ -171,8 +155,6 @@ class BrowserThread(QThread):
                 "headless": False,
                 "args": [
                     "--disable-blink-features=AutomationControlled",
-                    "--no-sandbox",
-                    "--disable-setuid-sandbox",
                 ],
             }
             if channel:
@@ -180,23 +162,27 @@ class BrowserThread(QThread):
             if executable_path:
                 kwargs["executable_path"] = executable_path
 
+            browser = None
             try:
                 browser = await playwright.chromium.launch(**kwargs)
                 context_kwargs: dict[str, Any] = {
-                    "ignore_https_errors": True,
+                    "ignore_https_errors": False,
                     "viewport": {"width": 1280, "height": 720},
                 }
                 if self.state_file.exists():
+                    import json
                     try:
-                        context_kwargs["storage_state"] = str(self.state_file)
-                    except Exception:
-                        pass
+                        context_kwargs["storage_state"] = json.loads(self.state_file.read_text(encoding="utf-8"))
+                    except (OSError, ValueError):
+                        self.status_changed.emit("Saved session is unreadable; starting a fresh session.")
 
                 context = await browser.new_context(**context_kwargs)
                 self.status_changed.emit(f"Successfully launched {label}.")
                 return browser, context
             except Exception as exc:
                 last_error = exc
+                if browser:
+                    await browser.close()
                 continue
 
         raise RuntimeError(f"Could not launch any browser instance. Last error: {last_error}")
@@ -230,6 +216,7 @@ class BrowserThread(QThread):
             if self.start_url:
                 await self._navigate(self.start_url)
 
+            self._browser.on("disconnected", lambda: setattr(self, "stop_requested", True))
             while not self.stop_requested:
                 await self._process_commands()
                 await asyncio.sleep(0.10)
@@ -255,7 +242,9 @@ class BrowserThread(QThread):
             except queue.Empty:
                 return
 
-            if command == "open_url":
+            if command == "reset":
+                self._seen_response_ids.clear()
+            elif command == "open_url":
                 await self._navigate(str(value or ""))
             elif command == "capture":
                 self.capture_enabled = bool(value)
@@ -288,7 +277,7 @@ class BrowserThread(QThread):
             # Scan HTML for inline m3u8 playlist links (e.g., Pornhub flashvars)
             try:
                 html_content = await page.content()
-                inline_m3u8_links = extract_m3u8_from_html(html_content)
+                inline_m3u8_links = extract_m3u8_from_html(html_content) if self.capture_enabled else []
                 user_agent = await self._get_page_user_agent(page)
                 for m3u8_link in inline_m3u8_links:
                     if not is_ad_domain(m3u8_link):
@@ -297,7 +286,7 @@ class BrowserThread(QThread):
                             source_page=page.url,
                             event_source="inline_html",
                             method="GET",
-                            status_code=200,
+                            status_code=None,
                             content_type="application/vnd.apple.mpegurl",
                             referer=page.url,
                             origin=origin_from_url(page.url),
@@ -321,14 +310,12 @@ class BrowserThread(QThread):
         self._active_page = page
 
         try:
-            if self.block_heavy_resources:
-                await page.route(
-                    "**/*",
-                    lambda route: route.abort()
-                    if route.request.resource_type in ["image", "font", "stylesheet"]
-                    and not is_probable_media_stream_url(route.request.url)
-                    else route.continue_(),
-                )
+            async def route_request(route):
+                if self.block_heavy_resources and route.request.resource_type in {"image", "font", "stylesheet"} and not is_probable_media_stream_url(route.request.url):
+                    await route.abort()
+                else:
+                    await route.continue_()
+            await page.route("**/*", route_request)
 
             page.on("request", lambda request: asyncio.create_task(self._on_request(page, request)))
             page.on("response", lambda response: asyncio.create_task(self._on_response(page, response)))
@@ -357,23 +344,22 @@ class BrowserThread(QThread):
         if is_ad_domain(url):
             return
 
-        # Auto-reconstruct parent M3U8 from segment chunks
         if is_segment_chunk(url):
-            derived_m3u8 = derive_m3u8_from_segment(url)
-            if derived_m3u8:
-                url = derived_m3u8
-            else:
-                return
+            return
 
         if not is_probable_media_stream_url(url):
             return
 
         try:
-            headers = dict(request.headers or {})
+            headers = await request.all_headers()
             referer = headers.get("referer", "")
             origin = headers.get("origin", "") or origin_from_url(referer or page.url)
             user_agent = headers.get("user-agent", "") or await self._get_page_user_agent(page)
 
+            if self._context:
+                cookies = await self._context.cookies([url])
+                if cookies:
+                    headers["cookie"] = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
             record = make_capture_record(
                 m3u8_url=url,
                 source_page=page.url,
@@ -401,13 +387,8 @@ class BrowserThread(QThread):
         if is_ad_domain(url):
             return
 
-        # Auto-reconstruct parent M3U8 from segment chunks
         if is_segment_chunk(url):
-            derived_m3u8 = derive_m3u8_from_segment(url)
-            if derived_m3u8:
-                url = derived_m3u8
-            else:
-                return
+            return
 
         headers = dict(response.headers or {})
         content_type = headers.get("content-type", "")
@@ -416,9 +397,12 @@ class BrowserThread(QThread):
             return
 
         response_key = f"{response.status}:{url}"
-        if response_key in self._seen_response_ids:
+        now = time.monotonic()
+        if now - self._seen_response_ids.get(response_key, -100) < 5:
             return
-        self._seen_response_ids.add(response_key)
+        self._seen_response_ids[response_key] = now
+        if len(self._seen_response_ids) > 5000:
+            self._seen_response_ids = {k: v for k, v in self._seen_response_ids.items() if now - v < 60}
 
         playlist_text = None
         should_read_body = is_probable_media_stream_url(url) or content_type_is_media_stream(content_type)
@@ -426,8 +410,8 @@ class BrowserThread(QThread):
         if should_read_body:
             try:
                 content_length = headers.get("content-length", "")
-                if not content_length or int(content_length) <= 2_000_000:
-                    playlist_text = await response.text()
+                if ("mpegurl" in content_type.lower() or "dash+xml" in content_type.lower() or url.split("?")[0].endswith((".m3u8", ".mpd"))) and (not content_length or int(content_length) <= 2_000_000):
+                    playlist_text = (await response.text())[:2_000_000]
                     if (
                         not looks_like_hls_text(playlist_text)
                         and not is_probable_media_stream_url(url)
@@ -439,11 +423,15 @@ class BrowserThread(QThread):
 
         try:
             request = response.request
-            request_headers = dict(request.headers or {})
+            request_headers = await request.all_headers()
             referer = request_headers.get("referer", "")
             origin = request_headers.get("origin", "") or origin_from_url(referer or page.url)
             user_agent = request_headers.get("user-agent", "") or await self._get_page_user_agent(page)
 
+            if self._context:
+                cookies = await self._context.cookies([url])
+                if cookies:
+                    request_headers["cookie"] = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
             record = make_capture_record(
                 m3u8_url=url,
                 source_page=page.url,
